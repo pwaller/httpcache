@@ -22,11 +22,18 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"flag"
 	"math/big"
 	_ "net"
 	"sort"
 	"time"
 )
+
+var cache_base = flag.String("cache-base", "cache", "cache base directory")
+var mitm_key = flag.String("mitm-key", "mitm-ca.key", "key for proxy MITM CA")
+var mitm_crt = flag.String("mitm-crt", "mitm-ca.crt", "certificate for MITM CA")
+
+var proxy_ca tls.Certificate
 
 func hashSorted(lst []string) *big.Int {
 	c := make([]string, len(lst))
@@ -47,7 +54,7 @@ func SignHost(ca *x509.Certificate, capriv interface{}, hosts []string) (pemCert
 		SerialNumber: hashSorted(hosts),
 		Issuer:       ca.Subject,
 		Subject: pkix.Name{
-			Organization: []string{"GoProxy untrusted MITM proxy Inc"},
+			Organization: []string{"Proxycache MITM proxy certificate"},
 		},
 		NotBefore: time.Now(),
 		NotAfter:  now.Add(365 * 24 * time.Hour),
@@ -78,42 +85,6 @@ func SignHost(ca *x509.Certificate, capriv interface{}, hosts []string) (pemCert
 	pem.Encode(pemCertBuf, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
 	return pemCertBuf.Bytes(), pemKeyBuf.Bytes(), nil
 }
-
-var CA_CERT = []byte(`-----BEGIN CERTIFICATE-----
-MIICSjCCAbWgAwIBAgIBADALBgkqhkiG9w0BAQUwSjEjMCEGA1UEChMaZ2l0aHVi
-LmNvbS9lbGF6YXJsL2dvcHJveHkxIzAhBgNVBAMTGmdpdGh1Yi5jb20vZWxhemFy
-bC9nb3Byb3h5MB4XDTAwMDEwMTAwMDAwMFoXDTQ5MTIzMTIzNTk1OVowSjEjMCEG
-A1UEChMaZ2l0aHViLmNvbS9lbGF6YXJsL2dvcHJveHkxIzAhBgNVBAMTGmdpdGh1
-Yi5jb20vZWxhemFybC9nb3Byb3h5MIGdMAsGCSqGSIb3DQEBAQOBjQAwgYkCgYEA
-vz9BbCaJjxs73Tvcq3leP32hAGerQ1RgvlZ68Z4nZmoVHfl+2Nr/m0dmW+GdOfpT
-cs/KzfJjYGr/84x524fiuR8GdZ0HOtXJzyF5seoWnbBIuyr1PbEpgRhGQMqqOUuj
-YExeLbfNHPIoJ8XZ1Vzyv3YxjbmjWA+S/uOe9HWtDbMCAwEAAaNGMEQwDgYDVR0P
-AQH/BAQDAgCkMBMGA1UdJQQMMAoGCCsGAQUFBwMBMA8GA1UdEwEB/wQFMAMBAf8w
-DAYDVR0RBAUwA4IBKjALBgkqhkiG9w0BAQUDgYEAIcL8huSmGMompNujsvePTUnM
-oEUKtX4Eh/+s+DSfV/TyI0I+3GiPpLplEgFWuoBIJGios0r1dKh5N0TGjxX/RmGm
-qo7E4jjJuo8Gs5U8/fgThZmshax2lwLtbRNwhvUVr65GdahLsZz8I+hySLuatVvR
-qHHq/FQORIiNyNpq/Hg=
------END CERTIFICATE-----`)
-
-var CA_KEY = []byte(`-----BEGIN RSA PRIVATE KEY-----
-MIICXQIBAAKBgQC/P0FsJomPGzvdO9yreV4/faEAZ6tDVGC+VnrxnidmahUd+X7Y
-2v+bR2Zb4Z05+lNyz8rN8mNgav/zjHnbh+K5HwZ1nQc61cnPIXmx6hadsEi7KvU9
-sSmBGEZAyqo5S6NgTF4tt80c8ignxdnVXPK/djGNuaNYD5L+4570da0NswIDAQAB
-AoGBALzIv1b4D7ARTR3NOr6V9wArjiOtMjUrdLhO+9vIp9IEA8ZsA9gjDlCEwbkP
-VDnoLjnWfraff5Os6+3JjHy1fYpUiCdnk2XA6iJSL1XWKQZPt3wOunxP4lalDgED
-QTRReFbA/y/Z4kSfTXpVj68ytcvSRW/N7q5/qRtbN9804jpBAkEA0s6lvH2btSLA
-mcEdwhs7zAslLbdld7rvfUeP82gPPk0S6yUqTNyikqshM9AwAktHY7WvYdKl+ghZ
-HTxKVC4DoQJBAOg/IAW5RbXknP+Lf7AVtBgw3E+Yfa3mcdLySe8hjxxyZq825Zmu
-Rt5Qj4Lw6ifSFNy4kiiSpE/ZCukYvUXGENMCQFkPxSWlS6tzSzuqQxBGwTSrYMG3
-wb6b06JyIXcMd6Qym9OMmBpw/J5KfnSNeDr/4uFVWQtTG5xO+pdHaX+3EQECQQDl
-qcbY4iX1gWVfr2tNjajSYz751yoxVbkpiT9joiQLVXYFvpu+JYEfRzsjmWl0h2Lq
-AftG8/xYmaEYcMZ6wSrRAkBUwiom98/8wZVlB6qbwhU1EKDFANvICGSWMIhPx3v7
-MJqTIj4uJhte2/uyVvZ6DC6noWYgy+kLgqG0S97tUEG8
------END RSA PRIVATE KEY-----`)
-
-var GoproxyCa, goproxyCaErr = tls.X509KeyPair(CA_CERT, CA_KEY)
-
-const cache_base = "cache"
 
 func logRequest(r *http.Request) *http.Request {
 	log.Println(r.Method, r.URL)
@@ -228,21 +199,36 @@ func ServeHTTPConn(conn net.Conn, handler http.Handler) error {
 	return nil
 }
 
+var certCache = map[string]tls.Certificate{}
+
 func MITMSSL(conn net.Conn, handler http.Handler, hostname string) {
 
-	ca, err := x509.ParseCertificate(GoproxyCa.Certificate[0])
-	certPem, keyPem, err := SignHost(ca, GoproxyCa.PrivateKey, []string{hostname})
-	if err != nil {
-		panic(err)
+	t := time.Now()
+
+	cert, ok := certCache[hostname]
+	if !ok {
+
+		// TODO: Cache certificates, since they are slow to generate
+		ca, err := x509.ParseCertificate(proxy_ca.Certificate[0])
+		certPem, keyPem, err := SignHost(ca, proxy_ca.PrivateKey, []string{hostname})
+		if err != nil {
+			panic(err)
+		}
+		cert, err = tls.X509KeyPair(certPem, keyPem)
+		if err != nil {
+			panic(err)
+		}
+		certCache[hostname] = cert
 	}
-	cert, err := tls.X509KeyPair(certPem, keyPem)
+
+	log.Printf("Took %v to generate cert", time.Since(t))
 
 	conn.Write([]byte("HTTP/1.1 200 200 OK\r\n\r\n"))
 
-	config := &tls.Config{Certificates: []tls.Certificate{cert, GoproxyCa}}
+	config := &tls.Config{Certificates: []tls.Certificate{cert, proxy_ca}}
 	sconn := tls.Server(conn, config)
 
-	err = sconn.Handshake()
+	err := sconn.Handshake()
 	if err != nil {
 		panic(err)
 	}
@@ -308,7 +294,7 @@ func (p *CachingProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		path += "index.html"
 	}
 
-	cache_path := filepath.Join(cache_base, url.Host, path)
+	cache_path := filepath.Join(*cache_base, url.Host, path)
 	if url.RawQuery != "" {
 		cache_path += "?" + url.RawQuery
 	}
@@ -340,6 +326,14 @@ func (p *CachingProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 }
 
 func main() {
+	flag.Parse()
+
+	var err error
+	proxy_ca, err = tls.LoadX509KeyPair(*mitm_crt, *mitm_key)
+	if err != nil {
+		panic(err)
+	}
+
 	log.Printf("Serving on :3128")
 	log.Fatal(http.ListenAndServe(":3128", &CachingProxy{}))
 }
