@@ -1,17 +1,29 @@
 package main
 
+// TODO:
+// read in npm certificate authority
+// transparent proxying of https - difficult since need to match domain
+// make pip install work
+// deal with /blah being a redirect to /blah/
+// Ensure that the other half of the connection is secure
+// Use special cache value (empty file?) to prevent caching
+// (configurably) Listen to caching headers
+
+// Transparent HTTPs proxy: very difficult, probably need to hack/reimplement tls.
+
 import (
 	"bytes"
 	"crypto/tls"
-	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 )
 
 import (
@@ -91,24 +103,6 @@ func logRequest(r *http.Request) *http.Request {
 	return r
 }
 
-func Respond(w http.ResponseWriter, r io.Reader) {
-
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		panic("can't hijack ResponseWriter")
-	}
-
-	conn, _, err := hj.Hijack()
-	if err != nil {
-		panic(err)
-	}
-	defer conn.Close()
-
-	io.Copy(conn, r)
-	//rw.Flush()
-
-}
-
 func CacheResponse(cache_path string, response_bytes []byte) {
 
 	moved := false
@@ -151,52 +145,6 @@ func CacheResponse(cache_path string, response_bytes []byte) {
 	}()
 
 	io.Copy(fd, bytes.NewBuffer(response_bytes))
-}
-
-type FakeListener struct {
-	c       net.Conn
-	served  bool
-	done    chan<- bool
-	Done    <-chan bool
-	handler http.Handler
-}
-
-var acceptedOne = fmt.Errorf("FakeListener.Accept: already accepted")
-
-func NewFakeListener(conn net.Conn, handler http.Handler) *FakeListener {
-	ch := make(chan bool)
-	return &FakeListener{conn, false, ch, ch, handler}
-}
-
-func (l *FakeListener) Accept() (net.Conn, error) {
-	if l.served {
-		<-l.Done
-		return nil, acceptedOne
-	}
-	l.served = true
-	return l.c, nil
-}
-
-func (l *FakeListener) Close() error {
-	return nil
-}
-
-func (l *FakeListener) Addr() net.Addr {
-	return l.c.LocalAddr()
-}
-
-func (l *FakeListener) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	defer close(l.done)
-	l.handler.ServeHTTP(w, r)
-}
-
-func ServeHTTPConn(conn net.Conn, handler http.Handler) error {
-	fakeListener := NewFakeListener(conn, handler)
-	err := http.Serve(fakeListener, fakeListener)
-	if err != nil && err != acceptedOne {
-		return err
-	}
-	return nil
 }
 
 var certCache = map[string]tls.Certificate{}
@@ -245,11 +193,39 @@ func MITMSSL(conn net.Conn, handler http.Handler, hostname string) {
 // TODO: query string
 type CachingProxy struct {
 	requestMangler func(req *http.Request) *http.Request
+
+	nbytes_served, n_served,
+	nbytes_live, n_live uint64
 }
 
 // ServeHTTP proxies the request given and writes the response to w.
-func (p *CachingProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	defer log.Println(" --> served", req.Method)
+
+	hj, ok := res.(http.Hijacker)
+	if !ok {
+		panic("can't hijack ResponseWriter")
+	}
+
+	conn, _, err := hj.Hijack()
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+
+	target := GetOriginalAddr(conn)
+
+	if target.String() != conn.LocalAddr().String() {
+		// It's a transparent proxy
+		req.URL.Host = req.Host
+		// TODO: Deal with SSL and non-standard ports.. somehow.
+		/*
+			if target.Port != 80 {
+				req.URL.Host += fmt.Sprintf(":%v", target.Port)
+			}
+		*/
+		req.URL.Scheme = "http"
+	}
 
 	if p.requestMangler != nil {
 		req = p.requestMangler(req)
@@ -258,23 +234,14 @@ func (p *CachingProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	logRequest(req)
 
 	if req.Method == "CONNECT" {
-		hj, ok := w.(http.Hijacker)
-		if !ok {
-			panic("can't hijack ResponseWriter")
-		}
-
-		conn, _, err := hj.Hijack()
-		if err != nil {
-			panic(err)
-		}
-		defer conn.Close()
 
 		host, _, err := net.SplitHostPort(req.URL.Host)
 		if err != nil {
 			panic(err)
 		}
+		// TODO: figure record bytes tracked by this temporary CachingProxy
 		MITMSSL(conn, &CachingProxy{
-			func(subreq *http.Request) *http.Request {
+			requestMangler: func(subreq *http.Request) *http.Request {
 				subreq.URL.Scheme = "https"
 				subreq.URL.Host = req.URL.Host
 				return subreq
@@ -300,27 +267,42 @@ func (p *CachingProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if fd, err := os.Open(cache_path); err == nil {
+		defer fd.Close()
 		log.Println("  -> Cached:", cache_path)
-		Respond(w, fd)
+		n, err := io.Copy(conn, fd)
+		if err != nil {
+			panic(err)
+		}
+		atomic.AddUint64(&p.n_served, 1)
+		atomic.AddUint64(&p.nbytes_served, uint64(n))
 		return
 	}
 
-	res, err := http.DefaultTransport.RoundTrip(req)
+	remote_res, err := http.DefaultTransport.RoundTrip(req)
 	if err != nil {
 		log.Println("proxy roundtrip fail:", err)
-		w.WriteHeader(http.StatusInternalServerError)
+		conn.Write([]byte("HTTP/1.1 500 500 Internal Server Error\r\n\r\n"))
 		return
 	}
 
-	response_bytes, err := httputil.DumpResponse(res, true)
+	response_bytes, err := httputil.DumpResponse(remote_res, true)
 	if err != nil {
 		log.Println("proxy dumpresponse fail:", err)
-		w.WriteHeader(http.StatusInternalServerError)
+		conn.Write([]byte("HTTP/1.1 500 500 Internal Server Error\r\n\r\n"))
 		return
 	}
 
 	CacheResponse(cache_path, response_bytes)
-	Respond(w, bytes.NewBuffer(response_bytes))
+
+	n, err := io.Copy(conn, bytes.NewBuffer(response_bytes))
+	if err != nil {
+		panic(err)
+	}
+
+	atomic.AddUint64(&p.n_served, 1)
+	atomic.AddUint64(&p.n_live, 1)
+	atomic.AddUint64(&p.nbytes_served, uint64(n))
+	atomic.AddUint64(&p.nbytes_live, uint64(n))
 
 	log.Println("  -> Live:", cache_path)
 }
@@ -328,12 +310,32 @@ func (p *CachingProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 func main() {
 	flag.Parse()
 
-	var err error
-	proxy_ca, err = tls.LoadX509KeyPair(*mitm_crt, *mitm_key)
-	if err != nil {
-		panic(err)
-	}
+	go func() {
+		// This is slow, so happens in its own goroutine.
+		// TODO: fix race condition with incoming connections
+		var err error
+		proxy_ca, err = tls.LoadX509KeyPair(*mitm_crt, *mitm_key)
+		if err != nil {
+			panic(err)
+		}
+	}()
 
-	log.Printf("Serving on :3128")
-	log.Fatal(http.ListenAndServe(":3128", &CachingProxy{}))
+	proxy := &CachingProxy{}
+	defer func() {
+		// TODO: Print amount transferred, # requests served
+		log.Printf("Served %v (%v) connections %v (%v) bytes [(cache miss)]",
+			proxy.n_served, proxy.n_live, proxy.nbytes_served, proxy.nbytes_live)
+	}()
+
+	go func() {
+		log.Printf("Serving on :3128")
+		err := http.ListenAndServe(":3128", proxy)
+		if err != nil {
+			panic(err)
+		}
+	}()
+
+	notified := make(chan os.Signal)
+	signal.Notify(notified, os.Interrupt, os.Kill)
+	<-notified
 }
