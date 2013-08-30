@@ -110,7 +110,11 @@ func CacheResponse(cache_path string, response io.Reader) int64 {
 	// If not move it out of the way and move it to .../index.html later
 	dir := filepath.Dir(cache_path)
 	if s, err := os.Stat(dir); err == nil {
-		if !s.IsDir() {
+		if s.IsDir() {
+			// TODO(pwaller): make this work in all cases, especially pip.
+			//log.Println()
+			//cache_path += "/proxycache.base"
+		} else {
 			err = os.Rename(dir, dir+".tmp.proxycache")
 			if err != nil {
 				panic(err)
@@ -125,7 +129,7 @@ func CacheResponse(cache_path string, response io.Reader) int64 {
 	}
 
 	if moved {
-		err = os.Rename(dir+".tmp.proxycache", filepath.Join(dir, "index.html"))
+		err = os.Rename(dir+".tmp.proxycache", filepath.Join(dir, "proxycache.base"))
 		if err != nil {
 			panic(err)
 		}
@@ -246,14 +250,22 @@ func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 		if err != nil {
 			panic(err)
 		}
-		// TODO: figure record bytes tracked by this temporary CachingProxy
-		MITMSSL(conn, &CachingProxy{
+
+		proxy := &CachingProxy{
 			requestMangler: func(subreq *http.Request) *http.Request {
 				subreq.URL.Scheme = "https"
 				subreq.URL.Host = req.URL.Host
 				return subreq
 			},
-		}, host)
+		}
+
+		MITMSSL(conn, proxy, host)
+
+		// Might be a multi-request connection
+		atomic.AddUint64(&p.n_served, proxy.n_served)
+		atomic.AddUint64(&p.n_live, proxy.n_live)
+		atomic.AddUint64(&p.nbytes_served, proxy.nbytes_served)
+		atomic.AddUint64(&p.nbytes_live, proxy.nbytes_live)
 		return
 	}
 
@@ -273,6 +285,13 @@ func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 		cache_path += "?" + url.RawQuery
 	}
 
+	// TODO: Check if cache_path is a directory.
+	// /dir/proxycache.bare?
+
+	if stat, err := os.Stat(cache_path); err == nil && stat.IsDir() {
+		cache_path += "/proxycache.base"
+	}
+
 	if fd, err := os.Open(cache_path); err == nil {
 		defer fd.Close()
 		log.Println("  -> Cached:", cache_path)
@@ -285,6 +304,7 @@ func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// TODO: Enable npm CA certificate
 	remote_res, err := http.DefaultTransport.RoundTrip(req)
 	if err != nil {
 		log.Println("proxy roundtrip fail:", err)
@@ -344,6 +364,11 @@ func main() {
 			panic(err)
 		}
 	}()
+
+	// TODO: transparent SSL MITMer?
+
+	// TODO: if flag.Args() is present, it's something we should exec.
+	// (and forward signals to)
 
 	notified := make(chan os.Signal)
 	signal.Notify(notified, os.Interrupt, os.Kill)
