@@ -18,7 +18,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -103,7 +102,7 @@ func logRequest(r *http.Request) *http.Request {
 	return r
 }
 
-func CacheResponse(cache_path string, response_bytes []byte) {
+func CacheResponse(cache_path string, response io.Reader) int64 {
 
 	moved := false
 
@@ -134,6 +133,7 @@ func CacheResponse(cache_path string, response_bytes []byte) {
 
 	fd, err := os.Create(cache_path)
 	if err != nil {
+		// Failure modes?
 		panic(err)
 	}
 
@@ -144,7 +144,14 @@ func CacheResponse(cache_path string, response_bytes []byte) {
 		}
 	}()
 
-	io.Copy(fd, bytes.NewBuffer(response_bytes))
+	n, err := io.Copy(fd, response)
+
+	if err != nil {
+		// TODO(pwaller): Failure modes?
+		// Out of disk, unable to write for any reason.
+		panic(err)
+	}
+	return n
 }
 
 var certCache = map[string]tls.Certificate{}
@@ -285,19 +292,23 @@ func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	response_bytes, err := httputil.DumpResponse(remote_res, true)
-	if err != nil {
-		log.Println("proxy dumpresponse fail:", err)
-		conn.Write([]byte("HTTP/1.1 500 500 Internal Server Error\r\n\r\n"))
-		return
-	}
-
-	CacheResponse(cache_path, response_bytes)
-
-	n, err := io.Copy(conn, bytes.NewBuffer(response_bytes))
+	response_reader, response_writer := io.Pipe()
+	n_recvd := make(chan int64)
+	go func() {
+		n_recvd <- CacheResponse(cache_path, response_reader)
+	}()
+	w := io.MultiWriter(response_writer, conn)
+	err = remote_res.Write(w)
 	if err != nil {
 		panic(err)
 	}
+	err = response_writer.Close()
+	if err != nil {
+		panic(err)
+	}
+
+	// Wait until CacheResponse is done copying the response to a file.
+	n := <-n_recvd
 
 	atomic.AddUint64(&p.n_served, 1)
 	atomic.AddUint64(&p.n_live, 1)
@@ -322,7 +333,6 @@ func main() {
 
 	proxy := &CachingProxy{}
 	defer func() {
-		// TODO: Print amount transferred, # requests served
 		log.Printf("Served %v (%v) connections %v (%v) bytes [(cache miss)]",
 			proxy.n_served, proxy.n_live, proxy.nbytes_served, proxy.nbytes_live)
 	}()
