@@ -124,11 +124,9 @@ FindCipherSuite:
 	}
 
 	certMsg := new(certificateMsg)
+	certMsg.certificates = config.getCertificate(clientHello.serverName, c.conn)
 	if len(clientHello.serverName) > 0 {
 		c.serverName = clientHello.serverName
-		certMsg.certificates = config.getCertificateForName(clientHello.serverName).Certificate
-	} else {
-		certMsg.certificates = config.Certificates[0].Certificate
 	}
 	finishedHash.Write(certMsg.marshal())
 	c.writeRecord(recordTypeHandshake, certMsg.marshal())

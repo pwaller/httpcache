@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"io"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -123,9 +124,16 @@ const (
 	RequireAndVerifyClientCert
 )
 
+type CertificateGetter interface {
+	GetCertificate(name string, conn net.Conn) [][]byte
+}
+
 // A Config structure is used to configure a TLS client or server. After one
 // has been passed to a TLS function it must not be modified.
 type Config struct {
+	// Hack: allow us to generate a certificate on demand
+	CertificateGetter CertificateGetter
+
 	// Rand provides the source of entropy for nonces and RSA blinding.
 	// If Rand is nil, TLS uses the cryptographic random reader in package
 	// crypto/rand.
@@ -180,6 +188,19 @@ type Config struct {
 	// CipherSuites is a list of supported cipher suites. If CipherSuites
 	// is nil, TLS uses a list of suites supported by the implementation.
 	CipherSuites []uint16
+}
+
+func (c *Config) getCertificate(name string, conn net.Conn) [][]byte {
+	if c.CertificateGetter != nil {
+		return c.CertificateGetter.GetCertificate(name, conn)
+	}
+
+	if len(name) > 0 {
+		return c.getCertificateForName(name).Certificate
+	} else {
+		return c.Certificates[0].Certificate
+	}
+	return nil
 }
 
 func (c *Config) rand() io.Reader {

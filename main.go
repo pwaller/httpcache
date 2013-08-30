@@ -13,16 +13,19 @@ package main
 
 import (
 	"bytes"
-	"crypto/tls"
 	"io"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+
+	"net/http"
+	//http "github.com/pwaller/httpcache/mitmhttps/http"
+	//"crypto/tls"
+	tls "github.com/pwaller/httpcache/mitmhttps/tls"
 )
 
 import (
@@ -158,27 +161,34 @@ func CacheResponse(cache_path string, response io.Reader) int64 {
 	return n
 }
 
+// TODO(pwaller): rw-locking for goroutine safety? Persistence?
 var certCache = map[string]tls.Certificate{}
+
+func MakeCert(hostname string) tls.Certificate {
+
+	cert, ok := certCache[hostname]
+	if ok {
+		return cert
+	}
+
+	ca, err := x509.ParseCertificate(proxy_ca.Certificate[0])
+	certPem, keyPem, err := SignHost(ca, proxy_ca.PrivateKey, []string{hostname})
+	if err != nil {
+		panic(err)
+	}
+	cert, err = tls.X509KeyPair(certPem, keyPem)
+	if err != nil {
+		panic(err)
+	}
+	certCache[hostname] = cert
+	return cert
+}
 
 func MITMSSL(conn net.Conn, handler http.Handler, hostname string) {
 
 	t := time.Now()
 
-	cert, ok := certCache[hostname]
-	if !ok {
-
-		// TODO: Cache certificates, since they are slow to generate
-		ca, err := x509.ParseCertificate(proxy_ca.Certificate[0])
-		certPem, keyPem, err := SignHost(ca, proxy_ca.PrivateKey, []string{hostname})
-		if err != nil {
-			panic(err)
-		}
-		cert, err = tls.X509KeyPair(certPem, keyPem)
-		if err != nil {
-			panic(err)
-		}
-		certCache[hostname] = cert
-	}
+	cert := MakeCert(hostname)
 
 	log.Printf("Took %v to generate cert", time.Since(t))
 
@@ -338,6 +348,22 @@ func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	log.Println("  -> Live:", cache_path)
 }
 
+type GenerateMITM struct {
+	ca tls.Certificate
+}
+
+func (gm GenerateMITM) GetCertificate(name string, conn net.Conn) [][]byte {
+	if name == "" {
+		// Crap. We don't know without contacting the intended target. Bail out.
+		panic("Not implemented")
+		target := GetOriginalAddr(conn)
+		// TODO
+		_ = target
+	}
+
+	return nil
+}
+
 func main() {
 	flag.Parse()
 
@@ -360,6 +386,20 @@ func main() {
 	go func() {
 		log.Printf("Serving on :3128")
 		err := http.ListenAndServe(":3128", proxy)
+		if err != nil {
+			panic(err)
+		}
+	}()
+
+	go func() {
+		cg := GenerateMITM{proxy_ca}
+		l, err := tls.Listen("tcp4", ":3192", &tls.Config{CertificateGetter: cg})
+		if err != nil {
+			panic(err)
+		}
+		defer l.Close()
+		log.Printf("SSL listening on :3192")
+		err = http.Serve(l, proxy)
 		if err != nil {
 			panic(err)
 		}
