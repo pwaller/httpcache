@@ -14,6 +14,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"time"
 )
@@ -54,6 +55,17 @@ type Conn struct {
 	hand     bytes.Buffer // handshake data waiting to be read
 
 	tmp [16]byte
+}
+
+func (c *Conn) GetFdCopy() (*os.File, error) {
+	filer, ok := c.conn.(interface {
+		File() (*os.File, error)
+	})
+	if !ok {
+		return nil, errors.New("Can't get File()")
+	}
+	return filer.File()
+
 }
 
 func (c *Conn) setError(err error) error {

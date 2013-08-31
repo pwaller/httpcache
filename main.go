@@ -1,19 +1,28 @@
+// Copyright 2013 The httpcache authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package main
 
-// TODO:
-// read in npm certificate authority
-// transparent proxying of https - difficult since need to match domain
-// make pip install work
-// deal with /blah being a redirect to /blah/
-// Ensure that the other half of the connection is secure
-// Use special cache value (empty file?) to prevent caching
-// (configurably) Listen to caching headers
+// TODO(pwaller):
 
-// Transparent HTTPs proxy: very difficult, probably need to hack/reimplement tls.
+// make pip install work
+// make npm work
+
+// deal with /blah being a redirect to /blah/
+// Use special cache value (empty file?) to prevent caching
+// (configurably) Respect to caching headers
+
+// improved error handling
+// use race detector
+// split code up into different files
+
+// Caching of URLs with query strings?
 
 import (
 	"bytes"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"os"
@@ -24,7 +33,7 @@ import (
 
 	"net/http"
 	//http "github.com/pwaller/httpcache/mitmhttps/http"
-	//"crypto/tls"
+	systls "crypto/tls"
 	tls "github.com/pwaller/httpcache/mitmhttps/tls"
 )
 
@@ -79,8 +88,8 @@ func SignHost(ca *x509.Certificate, capriv interface{}, hosts []string) (pemCert
 	}
 	for _, h := range hosts {
 		if ip := net.ParseIP(h); ip != nil {
-			// template.IPAddresses = append(template.IPAddresses, ip)
-			panic("Unimplemented")
+			//template.IPAddresses = append(template.IPAddresses, ip)
+			//panic("Unimplemented")
 		} else {
 			template.DNSNames = append(template.DNSNames, h)
 		}
@@ -115,7 +124,6 @@ func CacheResponse(cache_path string, response io.Reader) int64 {
 	if s, err := os.Stat(dir); err == nil {
 		if s.IsDir() {
 			// TODO(pwaller): make this work in all cases, especially pip.
-			//log.Println()
 			//cache_path += "/proxycache.base"
 		} else {
 			err = os.Rename(dir, dir+".tmp.proxycache")
@@ -162,17 +170,20 @@ func CacheResponse(cache_path string, response io.Reader) int64 {
 }
 
 // TODO(pwaller): rw-locking for goroutine safety? Persistence?
+
 var certCache = map[string]tls.Certificate{}
 
-func MakeCert(hostname string) tls.Certificate {
+func MakeCert(hostnames []string) *tls.Certificate {
 
-	cert, ok := certCache[hostname]
+	key := strings.Join(hostnames, " ")
+
+	cert, ok := certCache[key]
 	if ok {
-		return cert
+		return &cert
 	}
 
 	ca, err := x509.ParseCertificate(proxy_ca.Certificate[0])
-	certPem, keyPem, err := SignHost(ca, proxy_ca.PrivateKey, []string{hostname})
+	certPem, keyPem, err := SignHost(ca, proxy_ca.PrivateKey, hostnames)
 	if err != nil {
 		panic(err)
 	}
@@ -180,21 +191,22 @@ func MakeCert(hostname string) tls.Certificate {
 	if err != nil {
 		panic(err)
 	}
-	certCache[hostname] = cert
-	return cert
+	certCache[key] = cert
+	return &cert
 }
 
+// Man-in-the middle `conn`.
 func MITMSSL(conn net.Conn, handler http.Handler, hostname string) {
 
 	t := time.Now()
 
-	cert := MakeCert(hostname)
+	cert := MakeCert([]string{hostname})
 
 	log.Printf("Took %v to generate cert", time.Since(t))
 
 	conn.Write([]byte("HTTP/1.1 200 200 OK\r\n\r\n"))
 
-	config := &tls.Config{Certificates: []tls.Certificate{cert, proxy_ca}}
+	config := &tls.Config{Certificates: []tls.Certificate{*cert, proxy_ca}}
 	sconn := tls.Server(conn, config)
 
 	err := sconn.Handshake()
@@ -206,12 +218,8 @@ func MITMSSL(conn net.Conn, handler http.Handler, hostname string) {
 	if err != nil {
 		panic(err)
 	}
-
-	//sconn.Write([]byte("HTTP/1.1 200 200 OK\r\nConnection: close\r\n\r\nHello, world"))
-
 }
 
-// TODO: query string
 type CachingProxy struct {
 	requestMangler func(req *http.Request) *http.Request
 
@@ -236,16 +244,31 @@ func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 
 	target := GetOriginalAddr(conn)
 
-	if target.String() != conn.LocalAddr().String() {
+	is_tls := false
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		is_tls = true
+		f, err := tlsConn.GetFdCopy()
+		if err != nil {
+			panic(err)
+		}
+		defer f.Close()
+		target = GetAddrFromFile(f)
+	}
+
+	is_transparent := target.String() != conn.LocalAddr().String()
+
+	if is_transparent {
 		// It's a transparent proxy
 		req.URL.Host = req.Host
-		// TODO: Deal with SSL and non-standard ports.. somehow.
-		/*
-			if target.Port != 80 {
-				req.URL.Host += fmt.Sprintf(":%v", target.Port)
-			}
-		*/
-		req.URL.Scheme = "http"
+
+		// TODO: Port numbers?
+
+		if is_tls {
+			req.URL.Scheme = "https"
+			req.URL.Host += ":443"
+		} else {
+			req.URL.Scheme = "http"
+		}
 	}
 
 	if p.requestMangler != nil {
@@ -255,6 +278,8 @@ func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	logRequest(req)
 
 	if req.Method == "CONNECT" {
+		// Note: it is assumed that all CONNECT requests are https.
+		// This code needs to change if anyone needs this to behave otherwise.
 
 		host, _, err := net.SplitHostPort(req.URL.Host)
 		if err != nil {
@@ -314,14 +339,28 @@ func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// TODO: Enable npm CA certificate
-	remote_res, err := http.DefaultTransport.RoundTrip(req)
+	// TODO(pwaller): Enable loading of additional certificate files via
+	// commandline arguments
+	/*
+		rootPool := SystemRoots()
+		content, err := ioutil.ReadFile("/home/pwaller/Projects/httpcache/npm-ca.crt")
+		if err != nil {
+			panic(err)
+		}
+		rootPool.AppendCertsFromPEM(content)
+		tlsConfig := &systls.Config{RootCAs: rootPool}
+		t := &http.Transport{Proxy: http.ProxyFromEnvironment, TLSClientConfig: tlsConfig}
+	*/
+	t := http.DefaultTransport
+	remote_res, err := t.RoundTrip(req)
 	if err != nil {
 		log.Println("proxy roundtrip fail:", err)
 		conn.Write([]byte("HTTP/1.1 500 500 Internal Server Error\r\n\r\n"))
 		return
 	}
 
+	// Code to stream the result in lock-step to the client and to a cache file.
+	// Hmm. What happens if the client disconnects/errors?
 	response_reader, response_writer := io.Pipe()
 	n_recvd := make(chan int64)
 	go func() {
@@ -340,6 +379,7 @@ func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	// Wait until CacheResponse is done copying the response to a file.
 	n := <-n_recvd
 
+	// Record some statistics
 	atomic.AddUint64(&p.n_served, 1)
 	atomic.AddUint64(&p.n_live, 1)
 	atomic.AddUint64(&p.nbytes_served, uint64(n))
@@ -352,16 +392,52 @@ type GenerateMITM struct {
 	ca tls.Certificate
 }
 
-func (gm GenerateMITM) GetCertificate(name string, conn net.Conn) [][]byte {
-	if name == "" {
-		// Crap. We don't know without contacting the intended target. Bail out.
-		panic("Not implemented")
-		target := GetOriginalAddr(conn)
-		// TODO
-		_ = target
-	}
+func GetTargetServernames(addr net.Addr) (hosts []string, err error) {
+	// TODO(pwaller): configurable additional root CAs
+	log.Printf("GetTargetServernames(%v)", addr)
+	defer log.Printf(" <- GetTargetServernames(%v)", addr)
+	c, err := tls.Dial("tcp4", addr.String(), nil)
+	if err != nil {
+		if err, ok := err.(x509.HostnameError); ok {
+			// This is a tls error condition our side because we asked for an
+			// IP connection (we don't know the hostname of the target, only
+			// the IP).
 
-	return nil
+			hosts := err.Certificate.DNSNames
+			if len(hosts) == 0 {
+				hosts = []string{err.Certificate.Subject.CommonName} //err.Host}
+			}
+			log.Println("Hosts! ", hosts)
+			return hosts, nil
+		}
+		return
+	}
+	log.Println("Handshaking..")
+	err = c.Handshake()
+	if err != nil {
+		return
+	}
+	hosts = c.ConnectionState().PeerCertificates[0].DNSNames
+	return
+}
+
+func (gm GenerateMITM) GetCertificate(name string, conn net.Conn) *tls.Certificate {
+	var names []string
+	if name == "" {
+		// ClientHello didn't contain a hostname we can just impersonate directly.
+		// We'll have to go
+		target := GetOriginalAddr(conn)
+
+		// TODO(pwaller): cache ip:port -> certname mapping
+		var err error
+		names, err = GetTargetServernames(target)
+		if err != nil {
+			panic(err)
+		}
+	} else {
+		names = []string{name}
+	}
+	return MakeCert(names)
 }
 
 func main() {
@@ -391,9 +467,12 @@ func main() {
 		}
 	}()
 
+	// SSL server ready for transparent
 	go func() {
-		cg := GenerateMITM{proxy_ca}
-		l, err := tls.Listen("tcp4", ":3192", &tls.Config{CertificateGetter: cg})
+		tlsConfig := &tls.Config{CertificateGetter: GenerateMITM{proxy_ca}}
+		// TODO: This takes a little while to come up. Any way we can improve it?
+		// (maybe use tls.Listener?)
+		l, err := tls.Listen("tcp4", ":3192", tlsConfig)
 		if err != nil {
 			panic(err)
 		}
@@ -405,11 +484,12 @@ func main() {
 		}
 	}()
 
-	// TODO: transparent SSL MITMer?
-
-	// TODO: if flag.Args() is present, it's something we should exec.
+	// TODO(pwaller): if flag.Args() is present, it's something we should exec.
 	// (and forward signals to)
+	// * Should wait for sockets to be listening successfully
+	// * Thought, any way we can make a net namespace and do iptables transparently?
 
+	// Await CTRL-C or kill signals
 	notified := make(chan os.Signal)
 	signal.Notify(notified, os.Interrupt, os.Kill)
 	<-notified

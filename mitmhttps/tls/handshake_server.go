@@ -11,9 +11,11 @@ import (
 	"crypto/x509"
 	"errors"
 	"io"
+	"log"
 )
 
 func (c *Conn) serverHandshake() error {
+	log.Println("Server handshake")
 	config := c.config
 	msg, err := c.readHandshake()
 	if err != nil {
@@ -119,12 +121,13 @@ FindCipherSuite:
 	finishedHash.Write(hello.marshal())
 	c.writeRecord(recordTypeHandshake, hello.marshal())
 
-	if len(config.Certificates) == 0 {
+	if len(config.Certificates) == 0 && config.CertificateGetter == nil {
 		return c.sendAlert(alertInternalError)
 	}
 
 	certMsg := new(certificateMsg)
-	certMsg.certificates = config.getCertificate(clientHello.serverName, c.conn)
+	cert := config.getCertificate(clientHello.serverName, c.conn)
+	certMsg.certificates = cert.Certificate
 	if len(clientHello.serverName) > 0 {
 		c.serverName = clientHello.serverName
 	}
@@ -140,7 +143,9 @@ FindCipherSuite:
 	}
 
 	keyAgreement := suite.ka()
-	skx, err := keyAgreement.generateServerKeyExchange(config, clientHello, hello)
+	var tmpConfig Config = *config
+	tmpConfig.Certificates = []Certificate{*cert}
+	skx, err := keyAgreement.generateServerKeyExchange(&tmpConfig, clientHello, hello)
 	if err != nil {
 		c.sendAlert(alertHandshakeFailure)
 		return err
@@ -286,7 +291,7 @@ FindCipherSuite:
 		finishedHash.Write(certVerify.marshal())
 	}
 
-	preMasterSecret, err := keyAgreement.processClientKeyExchange(config, ckx, c.vers)
+	preMasterSecret, err := keyAgreement.processClientKeyExchange(&tmpConfig, ckx, c.vers)
 	if err != nil {
 		c.sendAlert(alertHandshakeFailure)
 		return err

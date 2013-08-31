@@ -3,21 +3,11 @@ package main
 import (
 	"log"
 	"net"
+	"os"
 	"syscall"
 )
 
-// Determine target address for a `conn` which has been
-// transparently redirected to our port
-func GetOriginalAddr(conn net.Conn) net.Addr {
-	tcpConn, ok := conn.(*net.TCPConn)
-	if !ok {
-		return conn.LocalAddr()
-	}
-	f, err := tcpConn.File()
-	if err != nil {
-		return conn.LocalAddr()
-	}
-	defer f.Close()
+func GetAddrFromFile(f *os.File) net.Addr {
 
 	const SO_ORIGINAL_DST = 80
 
@@ -34,6 +24,21 @@ func GetOriginalAddr(conn net.Conn) net.Addr {
 
 	target := &net.TCPAddr{IP: net.ParseIP(ipv4), Port: int(addr.Multiaddr[2])*256 + int(addr.Multiaddr[3])}
 	return target
+}
+
+// Determine target address for a `conn` which has been
+// transparently redirected to our port
+func GetOriginalAddr(conn net.Conn) net.Addr {
+	tcpConn, ok := conn.(*net.TCPConn)
+	if !ok {
+		return conn.LocalAddr()
+	}
+	f, err := tcpConn.File()
+	if err != nil {
+		return conn.LocalAddr()
+	}
+	defer f.Close()
+	return GetAddrFromFile(f)
 }
 
 // from pkg/net/parse.go

@@ -125,7 +125,7 @@ const (
 )
 
 type CertificateGetter interface {
-	GetCertificate(name string, conn net.Conn) [][]byte
+	GetCertificate(name string, conn net.Conn) *Certificate
 }
 
 // A Config structure is used to configure a TLS client or server. After one
@@ -190,15 +190,15 @@ type Config struct {
 	CipherSuites []uint16
 }
 
-func (c *Config) getCertificate(name string, conn net.Conn) [][]byte {
+func (c *Config) getCertificate(name string, conn net.Conn) *Certificate {
 	if c.CertificateGetter != nil {
 		return c.CertificateGetter.GetCertificate(name, conn)
 	}
 
 	if len(name) > 0 {
-		return c.getCertificateForName(name).Certificate
+		return c.getCertificateForName(name)
 	} else {
-		return c.Certificates[0].Certificate
+		return &c.Certificates[0]
 	}
 	return nil
 }
