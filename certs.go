@@ -8,7 +8,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
-	"log"
 	"math/big"
 	"net"
 	"sort"
@@ -50,25 +49,27 @@ type GenerateMITM struct {
 	ca tls.Certificate
 }
 
+// Determine ssl server names from a net.Addr
 func GetTargetServernames(addr net.Addr) (hosts []string, err error) {
-	// TODO(pwaller): configurable additional root CAs
-	c, err := tls.Dial("tcp4", addr.String(), nil)
+	c, err := tls.Dial("tcp4", addr.String(), &tls.Config{RootCAs: trust_db})
 	if err != nil {
 		if err, ok := err.(x509.HostnameError); ok {
 			// This is a tls error condition our side because we asked for an
 			// IP connection (we don't know the hostname of the target, only
 			// the IP).
 
+			// It's okay because we're just interested in finding out what hosts
+			// we should tell the client we are. If it is invalid, the client
+			// will bail out.
+
 			hosts := err.Certificate.DNSNames
 			if len(hosts) == 0 {
 				hosts = []string{err.Certificate.Subject.CommonName} //err.Host}
 			}
-			log.Println("Hosts! ", hosts)
 			return hosts, nil
 		}
 		return
 	}
-	log.Println("Handshaking..")
 	err = c.Handshake()
 	if err != nil {
 		return
