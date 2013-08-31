@@ -114,6 +114,30 @@ func CacheResponse(cache_path string, response io.Reader) int64 {
 	return n
 }
 
+// Determine cache location for `req`
+func getCachePath(req *http.Request) string {
+	url := req.URL
+	path := url.Path
+
+	if path == "" {
+		path = "/"
+	}
+	// Deal with directories
+	if strings.HasSuffix(path, "/") {
+		path += "index.html"
+	}
+
+	cache_path := filepath.Join(*cache_base, url.Host, path)
+	if url.RawQuery != "" {
+		cache_path += "?" + url.RawQuery
+	}
+
+	if stat, err := os.Stat(cache_path); err == nil && stat.IsDir() {
+		cache_path += "/proxycache.base"
+	}
+	return cache_path
+}
+
 // Man-in-the middle `conn`.
 func MITMSSL(conn net.Conn, handler http.Handler, hostname string) {
 
@@ -146,22 +170,35 @@ type CachingProxy struct {
 	nbytes_live, n_live uint64
 }
 
-// ServeHTTP proxies the request given and writes the response to w.
-func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
-	defer log.Println(" --> served", req.Method)
+func (p *CachingProxy) serveCONNECT(conn net.Conn, req *http.Request) {
+	// Note: it is assumed that all CONNECT requests are https.
+	// This code needs to change if anyone needs this to behave otherwise.
 
-	hj, ok := res.(http.Hijacker)
-	if !ok {
-		panic("can't hijack ResponseWriter")
-	}
-
-	conn, _, err := hj.Hijack()
+	host, _, err := net.SplitHostPort(req.URL.Host)
 	if err != nil {
 		panic(err)
 	}
-	defer conn.Close()
 
-	// TODO(pwaller): Wrap this into a function
+	proxy := &CachingProxy{
+		requestMangler: func(subreq *http.Request) *http.Request {
+			subreq.URL.Scheme = "https"
+			subreq.URL.Host = req.URL.Host
+			return subreq
+		},
+	}
+
+	MITMSSL(conn, proxy, host)
+
+	// Note: Might be a keep-alive connection with many requests.
+	atomic.AddUint64(&p.n_served, proxy.n_served)
+	atomic.AddUint64(&p.n_live, proxy.n_live)
+	atomic.AddUint64(&p.nbytes_served, proxy.nbytes_served)
+	atomic.AddUint64(&p.nbytes_live, proxy.nbytes_live)
+}
+
+// Determine if `conn` has been transparently redirected to us. If so, fix `req`
+// to reflect the intended destination
+func fixTransparentReq(conn net.Conn, req *http.Request) {
 	target := GetOriginalAddr(conn)
 
 	is_tls := false
@@ -190,6 +227,24 @@ func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 			req.URL.Scheme = "http"
 		}
 	}
+}
+
+// ServeHTTP proxies the request given and writes the response to w.
+func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
+	defer log.Println(" --> served", req.Method)
+
+	hj, ok := res.(http.Hijacker)
+	if !ok {
+		panic("can't hijack ResponseWriter")
+	}
+
+	conn, _, err := hj.Hijack()
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+
+	fixTransparentReq(conn, req)
 
 	if p.requestMangler != nil {
 		req = p.requestMangler(req)
@@ -198,53 +253,11 @@ func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	logRequest(req)
 
 	if req.Method == "CONNECT" {
-		// TODO(pwaller): Put this into a function
-		// Note: it is assumed that all CONNECT requests are https.
-		// This code needs to change if anyone needs this to behave otherwise.
-
-		host, _, err := net.SplitHostPort(req.URL.Host)
-		if err != nil {
-			panic(err)
-		}
-
-		proxy := &CachingProxy{
-			requestMangler: func(subreq *http.Request) *http.Request {
-				subreq.URL.Scheme = "https"
-				subreq.URL.Host = req.URL.Host
-				return subreq
-			},
-		}
-
-		MITMSSL(conn, proxy, host)
-
-		// Note: Might be a keep-alive connection with many requests.
-		atomic.AddUint64(&p.n_served, proxy.n_served)
-		atomic.AddUint64(&p.n_live, proxy.n_live)
-		atomic.AddUint64(&p.nbytes_served, proxy.nbytes_served)
-		atomic.AddUint64(&p.nbytes_live, proxy.nbytes_live)
+		p.serveCONNECT(conn, req)
 		return
 	}
 
-	// TODO(pwaller): Wrap cache_path computation into a function
-	url := req.URL
-	path := url.Path
-
-	if path == "" {
-		path = "/"
-	}
-	// Deal with directories
-	if strings.HasSuffix(path, "/") {
-		path += "index.html"
-	}
-
-	cache_path := filepath.Join(*cache_base, url.Host, path)
-	if url.RawQuery != "" {
-		cache_path += "?" + url.RawQuery
-	}
-
-	if stat, err := os.Stat(cache_path); err == nil && stat.IsDir() {
-		cache_path += "/proxycache.base"
-	}
+	cache_path := getCachePath(req)
 
 	if fd, err := os.Open(cache_path); err == nil {
 		defer fd.Close()
@@ -334,6 +347,7 @@ func main() {
 			proxy.n_served, proxy.n_live, proxy.nbytes_served, proxy.nbytes_live)
 	}()
 
+	// http proxy which works in both transparent and explicit-proxy configurations
 	go func() {
 		log.Printf("Serving on :3128")
 		err := http.ListenAndServe(":3128", proxy)
