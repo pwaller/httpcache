@@ -23,8 +23,10 @@ package main
 // non-firewalled systems
 
 import (
+	"crypto/x509"
 	"flag"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -35,14 +37,18 @@ import (
 	"sync/atomic"
 	"time"
 
+	systls "crypto/tls"
 	tls "github.com/pwaller/httpcache/mitmhttps/tls"
 )
 
 var cache_base = flag.String("cache-base", "cache", "cache base directory")
 var mitm_key = flag.String("mitm-key", "mitm-ca.key", "key for proxy MITM CA")
 var mitm_crt = flag.String("mitm-crt", "mitm-ca.crt", "certificate for MITM CA")
+var extra_crts = flag.String("extra-crts", "httpcache-trusted.crt",
+	"certificates to trust for outbound connections in addition to the system roots")
 
 var proxy_ca tls.Certificate
+var trust_db *x509.CertPool
 
 func logRequest(r *http.Request) *http.Request {
 	log.Println(r.Method, r.URL)
@@ -252,20 +258,9 @@ func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// TODO(pwaller): Enable loading of additional certificate files via
-	// commandline arguments
-	/*
-		rootPool := SystemRoots()
-		content, err := ioutil.ReadFile("/home/pwaller/Projects/httpcache/npm-ca.crt")
-		if err != nil {
-			panic(err)
-		}
-		rootPool.AppendCertsFromPEM(content)
-		tlsConfig := &systls.Config{RootCAs: rootPool}
-		t := &http.Transport{Proxy: http.ProxyFromEnvironment, TLSClientConfig: tlsConfig}
-	*/
+	tlsConfig := &systls.Config{RootCAs: trust_db}
+	t := &http.Transport{Proxy: http.ProxyFromEnvironment, TLSClientConfig: tlsConfig}
 
-	t := http.DefaultTransport
 	remote_res, err := t.RoundTrip(req)
 	if err != nil {
 		log.Println("proxy roundtrip fail:", err)
@@ -304,11 +299,25 @@ func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	log.Println("  -> Live:", cache_path)
 }
 
+func loadCerts() {
+	trust_db = SystemRoots()
+	content, err := ioutil.ReadFile(*extra_crts)
+	if err != nil {
+		return
+	}
+	trust_db.AppendCertsFromPEM(content)
+	log.Println("Loaded additional certificates to trust from", *extra_crts)
+}
+
 func main() {
 	flag.Parse()
 
+	loadCerts()
+
 	go func() {
 		// This is slow, so happens in its own goroutine.
+		// It should also probably happen after the listeners are started,
+		// since it can't be pre-empted.
 		// TODO(pwaller): fix race condition with incoming connections
 		var err error
 		proxy_ca, err = tls.LoadX509KeyPair(*mitm_crt, *mitm_key)
