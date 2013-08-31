@@ -32,6 +32,7 @@ func MakeCert(hostnames []string) *tls.Certificate {
 		return &cert
 	}
 
+	proxy_ca_ready.Wait()
 	ca, err := x509.ParseCertificate(proxy_ca.Certificate[0])
 	certPem, keyPem, err := SignHost(ca, proxy_ca.PrivateKey, hostnames)
 	if err != nil {

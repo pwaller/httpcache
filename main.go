@@ -22,6 +22,8 @@ package main
 // Security: prevent connections from unauthorized users on multi-user or
 // non-firewalled systems
 
+// If certificate doesn't exist, generate one
+
 import (
 	"crypto/x509"
 	"flag"
@@ -34,6 +36,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -47,6 +50,7 @@ var mitm_crt = flag.String("mitm-crt", "mitm-ca.crt", "certificate for MITM CA")
 var extra_crts = flag.String("extra-crts", "httpcache-trusted.crt",
 	"certificates to trust for outbound connections in addition to the system roots")
 
+var proxy_ca_ready sync.WaitGroup
 var proxy_ca tls.Certificate
 var trust_db *x509.CertPool
 
@@ -149,6 +153,7 @@ func MITMSSL(conn net.Conn, handler http.Handler, hostname string) {
 
 	conn.Write([]byte("HTTP/1.1 200 200 OK\r\n\r\n"))
 
+	proxy_ca_ready.Wait()
 	config := &tls.Config{Certificates: []tls.Certificate{*cert, proxy_ca}}
 	sconn := tls.Server(conn, config)
 
@@ -327,6 +332,54 @@ func main() {
 
 	loadCerts()
 
+	proxy := &CachingProxy{}
+
+	// On close, show amount served
+	defer func() {
+		log.Printf("Served %d (%d) connections %d (%d) bytes [(cache miss)]",
+			proxy.n_served, proxy.n_live, proxy.nbytes_served, proxy.nbytes_live)
+	}()
+
+	// Servers mustn't try to use the proxy_ca before we've initialized it
+	proxy_ca_ready.Add(1)
+
+	var started sync.WaitGroup
+
+	started.Add(1)
+	// http proxy which works in both transparent and explicit-proxy configurations
+	go func() {
+		log.Printf("Serving on :3128")
+		// TODO(pwaller): listen here, then call http.Serve
+		started.Done()
+		err := http.ListenAndServe(":3128", proxy)
+		if err != nil {
+			panic(err)
+		}
+	}()
+
+	started.Add(1)
+	// Transparent https proxy server
+	go func() {
+		tlsConfig := &tls.Config{CertificateGetter: GenerateMITM{proxy_ca}}
+
+		l, err := tls.Listen("tcp4", ":3192", tlsConfig)
+		if err != nil {
+			panic(err)
+		}
+		defer l.Close()
+
+		started.Done()
+
+		log.Printf("SSL listening on :3192")
+		err = http.Serve(l, proxy)
+		if err != nil {
+			panic(err)
+		}
+	}()
+
+	// Wait for servers to be listening before doing anything expensive
+	started.Wait()
+
 	go func() {
 		// This is slow, so happens in its own goroutine.
 		// It should also probably happen after the listeners are started,
@@ -337,47 +390,14 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-	}()
-
-	proxy := &CachingProxy{}
-
-	// On close, show amount served
-	defer func() {
-		log.Printf("Served %d (%d) connections %d (%d) bytes [(cache miss)]",
-			proxy.n_served, proxy.n_live, proxy.nbytes_served, proxy.nbytes_live)
-	}()
-
-	// http proxy which works in both transparent and explicit-proxy configurations
-	go func() {
-		log.Printf("Serving on :3128")
-		err := http.ListenAndServe(":3128", proxy)
-		if err != nil {
-			panic(err)
-		}
-	}()
-
-	// Transparent https proxy server
-	go func() {
-		tlsConfig := &tls.Config{CertificateGetter: GenerateMITM{proxy_ca}}
-		// TODO: This takes a little while to come up. Any way we can improve it?
-		// (maybe use tls.Listener?)
-		l, err := tls.Listen("tcp4", ":3192", tlsConfig)
-		if err != nil {
-			panic(err)
-		}
-		defer l.Close()
-
-		log.Printf("SSL listening on :3192")
-		err = http.Serve(l, proxy)
-		if err != nil {
-			panic(err)
-		}
+		proxy_ca_ready.Done()
 	}()
 
 	// TODO(pwaller): if flag.Args() is present, it's something we should exec.
 	// (and forward signals to)
 	// * Should wait for sockets to be listening successfully
 	// * Thought, any way we can make a net namespace and do iptables transparently?
+	// * Random free port assignment?
 
 	// Await CTRL-C or kill signals
 	notified := make(chan os.Signal)
