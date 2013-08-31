@@ -19,37 +19,23 @@ package main
 
 // Caching of URLs with query strings?
 
+// Security: prevent connections from unauthorized users on multi-user or
+// non-firewalled systems
+
 import (
-	"bytes"
+	"flag"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
-
-	"net/http"
-	//http "github.com/pwaller/httpcache/mitmhttps/http"
-	systls "crypto/tls"
-	tls "github.com/pwaller/httpcache/mitmhttps/tls"
-)
-
-import (
-	_ "bytes"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/sha1"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
-	"flag"
-	"math/big"
-	_ "net"
-	"sort"
 	"time"
+
+	tls "github.com/pwaller/httpcache/mitmhttps/tls"
 )
 
 var cache_base = flag.String("cache-base", "cache", "cache base directory")
@@ -58,65 +44,18 @@ var mitm_crt = flag.String("mitm-crt", "mitm-ca.crt", "certificate for MITM CA")
 
 var proxy_ca tls.Certificate
 
-func hashSorted(lst []string) *big.Int {
-	c := make([]string, len(lst))
-	copy(c, lst)
-	sort.Strings(c)
-	h := sha1.New()
-	for _, s := range c {
-		h.Write([]byte(s + ","))
-	}
-	rv := new(big.Int)
-	rv.SetBytes(h.Sum(nil))
-	return rv
-}
-
-func SignHost(ca *x509.Certificate, capriv interface{}, hosts []string) (pemCert []byte, pemKey []byte, err error) {
-	now := time.Now()
-	template := x509.Certificate{
-		SerialNumber: hashSorted(hosts),
-		Issuer:       ca.Subject,
-		Subject: pkix.Name{
-			Organization: []string{"Proxycache MITM proxy certificate"},
-		},
-		NotBefore: time.Now(),
-		NotAfter:  now.Add(365 * 24 * time.Hour),
-
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-	}
-	for _, h := range hosts {
-		if ip := net.ParseIP(h); ip != nil {
-			//template.IPAddresses = append(template.IPAddresses, ip)
-			//panic("Unimplemented")
-		} else {
-			template.DNSNames = append(template.DNSNames, h)
-		}
-	}
-	certpriv, err := rsa.GenerateKey(rand.Reader, 1024)
-	if err != nil {
-		return nil, nil, err
-	}
-	pemKeyBuf := new(bytes.Buffer)
-	pem.Encode(pemKeyBuf, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(certpriv)})
-	derBytes, err := x509.CreateCertificate(rand.Reader, &template, ca, &certpriv.PublicKey, capriv)
-	if err != nil {
-		return nil, nil, err
-	}
-	pemCertBuf := new(bytes.Buffer)
-	pem.Encode(pemCertBuf, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
-	return pemCertBuf.Bytes(), pemKeyBuf.Bytes(), nil
-}
-
 func logRequest(r *http.Request) *http.Request {
 	log.Println(r.Method, r.URL)
 	return r
 }
 
+// Stream `response` into the file at `cache_path`
 func CacheResponse(cache_path string, response io.Reader) int64 {
 
 	moved := false
+
+	// TODO(pwaller): If any of the path fragments in cache_path are directories
+	// we need to do some shuffling.
 
 	// Check that if the dir(cache_path) already exists that it is a file.
 	// If not move it out of the way and move it to .../index.html later
@@ -169,32 +108,6 @@ func CacheResponse(cache_path string, response io.Reader) int64 {
 	return n
 }
 
-// TODO(pwaller): rw-locking for goroutine safety? Persistence?
-
-var certCache = map[string]tls.Certificate{}
-
-func MakeCert(hostnames []string) *tls.Certificate {
-
-	key := strings.Join(hostnames, " ")
-
-	cert, ok := certCache[key]
-	if ok {
-		return &cert
-	}
-
-	ca, err := x509.ParseCertificate(proxy_ca.Certificate[0])
-	certPem, keyPem, err := SignHost(ca, proxy_ca.PrivateKey, hostnames)
-	if err != nil {
-		panic(err)
-	}
-	cert, err = tls.X509KeyPair(certPem, keyPem)
-	if err != nil {
-		panic(err)
-	}
-	certCache[key] = cert
-	return &cert
-}
-
 // Man-in-the middle `conn`.
 func MITMSSL(conn net.Conn, handler http.Handler, hostname string) {
 
@@ -242,6 +155,7 @@ func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	}
 	defer conn.Close()
 
+	// TODO(pwaller): Wrap this into a function
 	target := GetOriginalAddr(conn)
 
 	is_tls := false
@@ -261,7 +175,7 @@ func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 		// It's a transparent proxy
 		req.URL.Host = req.Host
 
-		// TODO: Port numbers?
+		// TODO(pwaller): Port numbers?
 
 		if is_tls {
 			req.URL.Scheme = "https"
@@ -278,6 +192,7 @@ func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	logRequest(req)
 
 	if req.Method == "CONNECT" {
+		// TODO(pwaller): Put this into a function
 		// Note: it is assumed that all CONNECT requests are https.
 		// This code needs to change if anyone needs this to behave otherwise.
 
@@ -296,7 +211,7 @@ func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 
 		MITMSSL(conn, proxy, host)
 
-		// Might be a multi-request connection
+		// Note: Might be a keep-alive connection with many requests.
 		atomic.AddUint64(&p.n_served, proxy.n_served)
 		atomic.AddUint64(&p.n_live, proxy.n_live)
 		atomic.AddUint64(&p.nbytes_served, proxy.nbytes_served)
@@ -304,6 +219,7 @@ func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// TODO(pwaller): Wrap cache_path computation into a function
 	url := req.URL
 	path := url.Path
 
@@ -319,9 +235,6 @@ func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	if url.RawQuery != "" {
 		cache_path += "?" + url.RawQuery
 	}
-
-	// TODO: Check if cache_path is a directory.
-	// /dir/proxycache.bare?
 
 	if stat, err := os.Stat(cache_path); err == nil && stat.IsDir() {
 		cache_path += "/proxycache.base"
@@ -351,6 +264,7 @@ func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 		tlsConfig := &systls.Config{RootCAs: rootPool}
 		t := &http.Transport{Proxy: http.ProxyFromEnvironment, TLSClientConfig: tlsConfig}
 	*/
+
 	t := http.DefaultTransport
 	remote_res, err := t.RoundTrip(req)
 	if err != nil {
@@ -360,7 +274,9 @@ func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	}
 
 	// Code to stream the result in lock-step to the client and to a cache file.
-	// Hmm. What happens if the client disconnects/errors?
+	// TODO(pwaller): Hmm. What happens if the client disconnects/errors?
+	// Idea: wrap conn in a writeErrorIgnorer{}?
+	// TODO(pwaller): Put this chunk of code into a function
 	response_reader, response_writer := io.Pipe()
 	n_recvd := make(chan int64)
 	go func() {
@@ -388,64 +304,12 @@ func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	log.Println("  -> Live:", cache_path)
 }
 
-type GenerateMITM struct {
-	ca tls.Certificate
-}
-
-func GetTargetServernames(addr net.Addr) (hosts []string, err error) {
-	// TODO(pwaller): configurable additional root CAs
-	log.Printf("GetTargetServernames(%v)", addr)
-	defer log.Printf(" <- GetTargetServernames(%v)", addr)
-	c, err := tls.Dial("tcp4", addr.String(), nil)
-	if err != nil {
-		if err, ok := err.(x509.HostnameError); ok {
-			// This is a tls error condition our side because we asked for an
-			// IP connection (we don't know the hostname of the target, only
-			// the IP).
-
-			hosts := err.Certificate.DNSNames
-			if len(hosts) == 0 {
-				hosts = []string{err.Certificate.Subject.CommonName} //err.Host}
-			}
-			log.Println("Hosts! ", hosts)
-			return hosts, nil
-		}
-		return
-	}
-	log.Println("Handshaking..")
-	err = c.Handshake()
-	if err != nil {
-		return
-	}
-	hosts = c.ConnectionState().PeerCertificates[0].DNSNames
-	return
-}
-
-func (gm GenerateMITM) GetCertificate(name string, conn net.Conn) *tls.Certificate {
-	var names []string
-	if name == "" {
-		// ClientHello didn't contain a hostname we can just impersonate directly.
-		// We'll have to go
-		target := GetOriginalAddr(conn)
-
-		// TODO(pwaller): cache ip:port -> certname mapping
-		var err error
-		names, err = GetTargetServernames(target)
-		if err != nil {
-			panic(err)
-		}
-	} else {
-		names = []string{name}
-	}
-	return MakeCert(names)
-}
-
 func main() {
 	flag.Parse()
 
 	go func() {
 		// This is slow, so happens in its own goroutine.
-		// TODO: fix race condition with incoming connections
+		// TODO(pwaller): fix race condition with incoming connections
 		var err error
 		proxy_ca, err = tls.LoadX509KeyPair(*mitm_crt, *mitm_key)
 		if err != nil {
@@ -454,8 +318,10 @@ func main() {
 	}()
 
 	proxy := &CachingProxy{}
+
+	// On close, show amount served
 	defer func() {
-		log.Printf("Served %v (%v) connections %v (%v) bytes [(cache miss)]",
+		log.Printf("Served %d (%d) connections %d (%d) bytes [(cache miss)]",
 			proxy.n_served, proxy.n_live, proxy.nbytes_served, proxy.nbytes_live)
 	}()
 
@@ -467,7 +333,7 @@ func main() {
 		}
 	}()
 
-	// SSL server ready for transparent
+	// Transparent https proxy server
 	go func() {
 		tlsConfig := &tls.Config{CertificateGetter: GenerateMITM{proxy_ca}}
 		// TODO: This takes a little while to come up. Any way we can improve it?
@@ -477,6 +343,7 @@ func main() {
 			panic(err)
 		}
 		defer l.Close()
+
 		log.Printf("SSL listening on :3192")
 		err = http.Serve(l, proxy)
 		if err != nil {
