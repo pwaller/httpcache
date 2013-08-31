@@ -4,18 +4,17 @@
 
 package main
 
-// TODO(pwaller):
+// TODO(pwaller): all of the below
 
 // make pip install work
 // make npm work
 
 // deal with /blah being a redirect to /blah/
 // Use special cache value (empty file?) to prevent caching
-// (configurably) Respect to caching headers
+// (configurably?) Respect caching headers
 
 // improved error handling
 // use race detector
-// split code up into different files
 
 // Caching of URLs with query strings?
 
@@ -23,6 +22,10 @@ package main
 // non-firewalled systems
 
 // If certificate doesn't exist, generate one
+
+// TODO(pwaller): Fix race condition of multiple queries to the same url
+// simultaneously. (It currently results in unsynchronized parallel writes to
+// the same file == bad thing). (Maybe use `groupcache`?)
 
 import (
 	"crypto/x509"
@@ -53,11 +56,6 @@ var extra_crts = flag.String("extra-crts", "httpcache-trusted.crt",
 var proxy_ca_ready sync.WaitGroup
 var proxy_ca tls.Certificate
 var trust_db *x509.CertPool
-
-func logRequest(r *http.Request) *http.Request {
-	log.Println(r.Method, r.URL)
-	return r
-}
 
 // Stream `response` into the file at `cache_path`
 func CacheResponse(cache_path string, response io.Reader) int64 {
@@ -234,11 +232,53 @@ func fixTransparentReq(conn net.Conn, req *http.Request) {
 	}
 }
 
+// Swallow write errors
+type writeErrorSwallower struct{ io.Writer }
+
+func (w writeErrorSwallower) Write(p []byte) (n int, err error) {
+	n, _ = w.Writer.Write(p)
+	return
+}
+
+// Code to stream the result in lock-step to the client and to a cache file.
+// If conn terminates, continue streaming the response into the cache.
+func streamAndCache(res *http.Response, conn net.Conn, cache_path string) int64 {
+	response_reader, cache_writer := io.Pipe()
+	defer func() {
+		err := cache_writer.Close()
+		if err != nil {
+			panic(err)
+		}
+	}()
+
+	n_recvd := make(chan int64)
+	go func() {
+		n_recvd <- CacheResponse(cache_path, response_reader)
+	}()
+
+	// Swallow write errors to `conn` since we want it to keep writing to the
+	// cache even if conn goes away
+	w := io.MultiWriter(cache_writer, writeErrorSwallower{conn})
+	err := res.Write(w)
+	if err != nil {
+		panic(err)
+	}
+
+	// Wait until CacheResponse is done copying the response to a file.
+	n := <-n_recvd
+	return n
+}
+
+func logRequest(r *http.Request) *http.Request {
+	log.Println(r.Method, r.URL)
+	return r
+}
+
 // ServeHTTP proxies the request given and writes the response to w.
-func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
+func (p *CachingProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	defer log.Println(" --> served", req.Method)
 
-	hj, ok := res.(http.Hijacker)
+	hj, ok := w.(http.Hijacker)
 	if !ok {
 		panic("can't hijack ResponseWriter")
 	}
@@ -265,6 +305,7 @@ func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	cache_path := getCachePath(req)
 
 	if fd, err := os.Open(cache_path); err == nil {
+		// Respond from cache, if it exists
 		defer fd.Close()
 		log.Println("  -> Cached:", cache_path)
 		n, err := io.Copy(conn, fd)
@@ -276,37 +317,24 @@ func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	tlsConfig := &systls.Config{RootCAs: trust_db}
-	t := &http.Transport{Proxy: http.ProxyFromEnvironment, TLSClientConfig: tlsConfig}
+	// No cached value present. Fetch it from a real server.
 
-	remote_res, err := t.RoundTrip(req)
+	// TODO(pwaller): groupcache keyed on cache_path?
+	// Maybe we want something smarter? Stream the amount that has been cached
+	// to a file, then add it to the list of multi-writers? 
+	// Sounds like a racey nightmare. Might be possible though.
+
+	t := &http.Transport{Proxy: http.ProxyFromEnvironment,
+		TLSClientConfig: &systls.Config{RootCAs: trust_db}}
+
+	res, err := t.RoundTrip(req)
 	if err != nil {
 		log.Println("proxy roundtrip fail:", err)
 		conn.Write([]byte("HTTP/1.1 500 500 Internal Server Error\r\n\r\n"))
 		return
 	}
 
-	// Code to stream the result in lock-step to the client and to a cache file.
-	// TODO(pwaller): Hmm. What happens if the client disconnects/errors?
-	// Idea: wrap conn in a writeErrorIgnorer{}?
-	// TODO(pwaller): Put this chunk of code into a function
-	response_reader, response_writer := io.Pipe()
-	n_recvd := make(chan int64)
-	go func() {
-		n_recvd <- CacheResponse(cache_path, response_reader)
-	}()
-	w := io.MultiWriter(response_writer, conn)
-	err = remote_res.Write(w)
-	if err != nil {
-		panic(err)
-	}
-	err = response_writer.Close()
-	if err != nil {
-		panic(err)
-	}
-
-	// Wait until CacheResponse is done copying the response to a file.
-	n := <-n_recvd
+	n := streamAndCache(res, conn, cache_path)
 
 	// Record some statistics
 	atomic.AddUint64(&p.n_served, 1)
@@ -317,20 +345,20 @@ func (p *CachingProxy) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	log.Println("  -> Live:", cache_path)
 }
 
-func loadCerts() {
+func loadCerts(extra_crts string) {
 	trust_db = SystemRoots()
-	content, err := ioutil.ReadFile(*extra_crts)
+	content, err := ioutil.ReadFile(extra_crts)
 	if err != nil {
 		return
 	}
 	trust_db.AppendCertsFromPEM(content)
-	log.Println("Loaded additional certificates to trust from", *extra_crts)
+	log.Println("Loaded additional certificates to trust from", extra_crts)
 }
 
 func main() {
 	flag.Parse()
 
-	loadCerts()
+	loadCerts(*extra_crts)
 
 	proxy := &CachingProxy{}
 
@@ -349,9 +377,12 @@ func main() {
 	// http proxy which works in both transparent and explicit-proxy configurations
 	go func() {
 		log.Printf("Serving on :3128")
-		// TODO(pwaller): listen here, then call http.Serve
+		l, err := net.Listen("tcp4", ":3128")
+		if err != nil {
+			panic(err)
+		}
 		started.Done()
-		err := http.ListenAndServe(":3128", proxy)
+		err = http.Serve(l, proxy)
 		if err != nil {
 			panic(err)
 		}
@@ -378,6 +409,7 @@ func main() {
 	}()
 
 	// Wait for servers to be listening before doing anything expensive
+	// (in case GOMAXPROCS is 1 and there is no pre-emption)
 	started.Wait()
 
 	go func() {
