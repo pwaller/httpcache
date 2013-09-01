@@ -6,6 +6,8 @@ package main
 
 // TODO(pwaller): all of the below
 
+// Unit tests?
+
 // make pip install work
 // make npm work
 
@@ -27,6 +29,11 @@ package main
 // simultaneously. (It currently results in unsynchronized parallel writes to
 // the same file == bad thing). (Maybe use `groupcache`?)
 
+// Idea: LD_PRELOAD a module into target process so that they see a different
+// set of root certificates, and that their connect() is redirected transparently?
+// Note: going to have to do a trick to pass along destination host. Maybe re-use
+// CONNECT?
+
 import (
 	"crypto/x509"
 	"flag"
@@ -41,6 +48,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	systls "crypto/tls"
@@ -171,6 +179,8 @@ type CachingProxy struct {
 
 	nbytes_served, n_served,
 	nbytes_live, n_live uint64
+
+	Transport *http.Transport
 }
 
 func (p *CachingProxy) serveCONNECT(conn net.Conn, req *http.Request) {
@@ -188,6 +198,7 @@ func (p *CachingProxy) serveCONNECT(conn net.Conn, req *http.Request) {
 			subreq.URL.Host = req.URL.Host
 			return subreq
 		},
+		Transport: p.Transport,
 	}
 
 	MITMSSL(conn, proxy, host)
@@ -285,19 +296,23 @@ func (p *CachingProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	conn, _, err := hj.Hijack()
 	if err != nil {
-		panic(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		log.Printf("Couldn't hijack connection, something is wrong: %q", err)
+		return
 	}
 	defer conn.Close()
 
 	fixTransparentReq(conn, req)
 
 	if p.requestMangler != nil {
+		// Mechanism to allow URL fixups by serveCONNECT
 		req = p.requestMangler(req)
 	}
 
 	logRequest(req)
 
 	if req.Method == "CONNECT" {
+		// Handle non-transparent https connections
 		p.serveCONNECT(conn, req)
 		return
 	}
@@ -310,6 +325,7 @@ func (p *CachingProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		log.Println("  -> Cached:", cache_path)
 		n, err := io.Copy(conn, fd)
 		if err != nil {
+			// Do something.
 			panic(err)
 		}
 		atomic.AddUint64(&p.n_served, 1)
@@ -324,10 +340,7 @@ func (p *CachingProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// to a file, then add it to the list of multi-writers? 
 	// Sounds like a racey nightmare. Might be possible though.
 
-	t := &http.Transport{Proxy: http.ProxyFromEnvironment,
-		TLSClientConfig: &systls.Config{RootCAs: trust_db}}
-
-	res, err := t.RoundTrip(req)
+	res, err := p.Transport.RoundTrip(req)
 	if err != nil {
 		log.Println("proxy roundtrip fail:", err)
 		conn.Write([]byte("HTTP/1.1 500 500 Internal Server Error\r\n\r\n"))
@@ -360,7 +373,12 @@ func main() {
 
 	loadCerts(*extra_crts)
 
-	proxy := &CachingProxy{}
+	proxy := &CachingProxy{
+		Transport: &http.Transport{
+			Proxy:           http.ProxyFromEnvironment,
+			TLSClientConfig: &systls.Config{RootCAs: trust_db},
+		},
+	}
 
 	// On close, show amount served
 	defer func() {
@@ -413,10 +431,7 @@ func main() {
 	started.Wait()
 
 	go func() {
-		// This is slow, so happens in its own goroutine.
-		// It should also probably happen after the listeners are started,
-		// since it can't be pre-empted.
-		// TODO(pwaller): fix race condition with incoming connections
+		// This is slow, so happens in its own goroutine after starting listeners.
 		var err error
 		proxy_ca, err = tls.LoadX509KeyPair(*mitm_crt, *mitm_key)
 		if err != nil {
@@ -429,10 +444,11 @@ func main() {
 	// (and forward signals to)
 	// * Should wait for sockets to be listening successfully
 	// * Thought, any way we can make a net namespace and do iptables transparently?
+	//   ld_preload connect() and open()?
 	// * Random free port assignment?
 
-	// Await CTRL-C or kill signals
+	// Await CTRL-C (Interrupt) or kill signals
 	notified := make(chan os.Signal)
-	signal.Notify(notified, os.Interrupt, os.Kill)
+	signal.Notify(notified, os.Interrupt, os.Kill, syscall.SIGTERM)
 	<-notified
 }
