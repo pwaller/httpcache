@@ -20,7 +20,7 @@ Installation:
   (`go version` should be enough to test if it is installed)
 * Set your `GOPATH` and `PATH`, for example:
   `export GOPATH="${HOME}/.local"`
-  `export PATH="${HOME}/.local/bin"`
+  `export PATH="${HOME}/.local/bin:$PATH"`
 * run `go get github.com/pwaller/httpcache`
 * run `httpcache`
 
