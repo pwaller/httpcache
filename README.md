@@ -1,5 +1,7 @@
 # httpcache
 
+## This project is of *alpha* quality and is more of a proof of concept than a functioning thing which can be used in production.
+
 The zero configuration caching man in the middling http(s) proxy
 
 Goals:
@@ -11,6 +13,16 @@ Goals:
 * Cache `apt-get update/upgrade`, `pip install` and `npm install`
 
 ### Note: The MITM feature (see: the openssl certificate commands) should only be used if you understand the security implications. Note that if you do this wrong you break the security of all https connections from your machine, including those from firefox or google chrome to your bank!
+
+Installation:
+
+* Install `golang-go` or otherwise get a working go installation
+  (`go version` should be enough to test if it is installed)
+* Set your `GOPATH` and `PATH`, for example:
+  `export GOPATH="${HOME}/.local"`
+  `export PATH="${HOME}/.local/bin:$PATH"`
+* run `go get github.com/pwaller/httpcache`
+* run `httpcache`
 
 Usage:
 
